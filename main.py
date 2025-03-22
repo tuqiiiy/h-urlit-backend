@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 import uvicorn
 import re
 import random
@@ -11,6 +11,7 @@ import urllib.parse
 import tldextract
 import numpy as np
 from typing import List, Dict, Optional, Any
+import os
 
 app = FastAPI(
     title="H-URLiT API",
@@ -50,7 +51,69 @@ class URLAnalysisResponse(BaseModel):
     ml_score: int
     api_score: int
     final_score: int
+    verdict: str  # Yeni eklenen verdict alanı
     features: URLFeatures
+
+# URL doğrulama yardımcı fonksiyonu
+def is_valid_url(url: str) -> bool:
+    """URL'nin geçerli bir formatta olup olmadığını kontrol eder."""
+    pattern = re.compile(
+        r'^(?:http|https)://'  # http:// veya https:// ile başlamalı
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # domain
+        r'localhost|'  # localhost
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # IP adresi
+        r'(?::\d+)?'  # opsiyonel port
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    
+    return bool(pattern.match(url))
+
+# URL doğrulama ve normalizasyon bağımlılığı
+async def validate_and_normalize_url(request: URLRequest) -> str:
+    """
+    URL'yi doğrular ve normalleştirir.
+    
+    Doğrulama kriterleri:
+    - URL boş olmamalı
+    - URL geçerli bir formatta olmalı
+    
+    Normalizasyon:
+    - URL'nin başında http:// veya https:// yoksa http:// ekler
+    
+    Geçersiz URL durumunda HTTPException fırlatır.
+    """
+    # URL boş mu kontrol et
+    if not request.url or request.url.strip() == "":
+        raise HTTPException(
+            status_code=400, 
+            detail="URL boş olamaz. Lütfen geçerli bir URL girin."
+        )
+    
+    # URL'yi normalize et
+    url = request.url.strip()
+    if not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
+    
+    # URL formatını kontrol et
+    if not is_valid_url(url):
+        raise HTTPException(
+            status_code=400, 
+            detail="Geçersiz URL formatı. Lütfen http:// veya https:// ile başlayan geçerli bir URL girin."
+        )
+    
+    return url
+
+# Loglama fonksiyonu
+def log_analysis(url: str, final_score: int, verdict: str) -> None:
+    """URL analiz sonuçlarını log.txt dosyasına kaydeder."""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] URL: {url} | Skor: {final_score} | Verdict: {verdict}\n"
+        
+        with open("log.txt", "a", encoding="utf-8") as log_file:
+            log_file.write(log_entry)
+    except Exception as e:
+        # Loglama hatası API'nin çalışmasını etkilememeli
+        print(f"Loglama hatası: {str(e)}")
 
 # ===== URL Analysis Modules =====
 
@@ -424,10 +487,6 @@ class URLAnalyzer:
         }
     
     def analyze(self, url: str) -> URLAnalysisResponse:
-        # Normalize URL
-        if not url.startswith(('http://', 'https://')):
-            url = 'http://' + url
-            
         # Run all analyzers
         structure_result = self.structure_analyzer.analyze(url)
         linguistic_result = self.linguistic_analyzer.analyze(url)
@@ -454,6 +513,10 @@ class URLAnalyzer:
         
         # Apply sigmoid normalization to final score
         normalized_score = self._sigmoid_normalize(weighted_score)
+        final_score = round(normalized_score)
+        
+        # Determine verdict based on final score
+        verdict = self._get_verdict(final_score)
         
         # Format all features
         all_features = {
@@ -464,6 +527,9 @@ class URLAnalyzer:
             **api_result["features"]
         }
         
+        # Log analysis result
+        log_analysis(url, final_score, verdict)
+        
         # Construct response
         return URLAnalysisResponse(
             structure_score=round(structure_result["score"]),
@@ -471,7 +537,8 @@ class URLAnalyzer:
             whois_score=round(whois_result["score"]),
             ml_score=round(ml_result["score"]),
             api_score=round(api_result["score"]),
-            final_score=round(normalized_score),
+            final_score=final_score,
+            verdict=verdict,
             features=URLFeatures(**all_features)
         )
     
@@ -480,18 +547,37 @@ class URLAnalyzer:
         # Adjusting sigmoid to make the mid-range around 50
         normalized = 100 / (1 + math.exp(-0.1 * (value - 50)))
         return normalized
+    
+    def _get_verdict(self, score: int) -> str:
+        """Skor değerine göre verdict (yorum) belirler"""
+        if score >= 80:
+            return "Güvenli"
+        elif score >= 50:
+            return "Şüpheli"
+        else:
+            return "Tehlikeli"
 
 # Initialize the URL analyzer
 url_analyzer = URLAnalyzer()
 
-# API endpoint
+# API endpoints
 @app.post("/analyze", response_model=URLAnalysisResponse)
-async def analyze_url(request: URLRequest):
+async def analyze_url(validated_url: str = Depends(validate_and_normalize_url)):
+    """URL'yi analiz eder ve tehdit skorunu döndürür."""
     try:
-        result = url_analyzer.analyze(request.url)
+        result = url_analyzer.analyze(validated_url)
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error analyzing URL: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"URL analiz edilirken hata oluştu: {str(e)}")
+
+@app.post("/check_url", response_model=URLAnalysisResponse)
+async def check_url(validated_url: str = Depends(validate_and_normalize_url)):
+    """URL'yi kontrol eder ve tehdit skorunu döndürür."""
+    try:
+        result = url_analyzer.analyze(validated_url)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"URL kontrol edilirken hata oluştu: {str(e)}")
 
 # Health check endpoint
 @app.get("/health")
